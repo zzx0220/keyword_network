@@ -48,6 +48,29 @@ python literature_keyword_network.py ./papers --top-n 35 --min-df 1
 
 自动提取模式会分析 PDF 全文，不依赖任何预设学科词表。它使用通用 TF-IDF 选择 1–3 词短语，再用 `sentence-transformers` 保守合并语义相似的候选词；首次运行可能需要下载模型。
 
+## 语义相似节点分组
+
+程序会在自动合并之外，进一步将仍然保留但语义相近的节点标记为 semantic group。PNG 和交互式 HTML 会使用同色半透明圆角框包围同组节点，GraphML 节点中会写入 `semantic_group` 属性，并额外生成 `semantic_groups.csv` 供审计。
+
+默认分组阈值为 `0.72`，越高越严格：
+
+```bash
+python literature_keyword_network.py ./papers --keywords-file keywords.txt --group-threshold 0.78
+```
+
+设为 `0` 可关闭语义框选：
+
+```bash
+python literature_keyword_network.py ./papers --keywords-file keywords.txt --group-threshold 0
+```
+
+默认情况下，相似度达到 `--merge-threshold` 的高度同义词仍会先合并为一个节点。如果希望尽量保留每个原始节点，再通过框选表示同义关系，可使用：
+
+```bash
+python literature_keyword_network.py ./papers --keywords-file keywords.txt \
+  --merge-threshold 1.0 --group-threshold 0.72
+```
+
 ## 安装
 
 ```bash

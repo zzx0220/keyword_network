@@ -1,1 +1,1 @@
-action stopping, action reprogramming, prediction, prediction error, perception, stopping
+action stopping, action reprogramming, prediction, prediction error, perception, stopping, surprise, expectation, unexpected

@@ -2,12 +2,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 from literature_keyword_network import (
     build_topic_config,
     extract_candidates,
     extract_custom_keywords,
     load_custom_keywords,
     relevant_context,
+    semantic_groups,
 )
 
 
@@ -85,6 +88,19 @@ class CustomKeywordTests(unittest.TestCase):
         text = "Predictive models provide useful evidence for the proposed computational framework."
         selected = relevant_context(text, build_topic_config(["prediction"]), window=0)
         self.assertEqual(selected, text)
+
+    def test_semantic_groups_use_complete_link_and_skip_singletons(self):
+        terms = ["alpha", "beta", "gamma", "unrelated"]
+        similarity = np.array([
+            [1.00, 0.86, 0.60, 0.10],
+            [0.86, 1.00, 0.80, 0.12],
+            [0.60, 0.80, 1.00, 0.08],
+            [0.10, 0.12, 0.08, 1.00],
+        ])
+        assignments, table = semantic_groups(terms, similarity, threshold=0.75)
+        self.assertEqual(assignments, {"alpha": "G1", "beta": "G1"})
+        self.assertEqual(table["keyword"].tolist(), ["alpha", "beta"])
+        self.assertTrue((table["group_size"] == 2).all())
 
 
 if __name__ == "__main__":

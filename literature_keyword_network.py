@@ -12,6 +12,7 @@
   excluded_keyword_candidates.csv 被通用筛选排除的高分词（供审计）
   keyword_clusters.csv           原词到合并后概念的映射及相似度
   merge_suggestions.csv          未自动合并、但值得人工检查的相似词对
+  semantic_groups.csv            网络节点的语义相似分组
   keyword_frequency.csv          合并后的关键词文献频率
   paper_keyword_matrix.csv       论文 × 关键词二值矩阵
   keyword_cooccurrence.csv       关键词 × 关键词共现矩阵
@@ -35,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -42,6 +44,7 @@ from pathlib import Path
 
 import pymupdf as fitz
 import matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch
 import networkx as nx
 import numpy as np
 import pandas as pd
@@ -102,6 +105,8 @@ def parse_args() -> argparse.Namespace:
                         help="自动语义合并阈值；越高越保守")
     parser.add_argument("--suggest-threshold", type=float, default=0.78,
                         help="人工复核候选对的最低相似度")
+    parser.add_argument("--group-threshold", type=float, default=0.72,
+                        help="将语义相似节点框在一起的最低相似度；0 关闭")
     parser.add_argument("--max-df", type=float, default=1.0,
                         help="忽略出现比例高于此值的候选词")
     parser.add_argument("--min-association", type=float, default=0.35,
@@ -375,13 +380,11 @@ class UnionFind:
             self.parent[rb] = ra
 
 
-def semantic_clusters(
-    terms: np.ndarray,
-    doc_frequency: np.ndarray,
-    merge_threshold: float,
-    suggest_threshold: float,
-    topic: TopicConfig | None = None,
-) -> tuple[list[list[int]], np.ndarray, pd.DataFrame]:
+def semantic_similarity(terms: list[str] | np.ndarray) -> np.ndarray:
+    """使用通用句子 embedding 计算关键词两两语义相似度。"""
+    # 某些 macOS/Conda 组合在 PyTorch 多 OpenMP 线程编码短文本时会崩溃。
+    # 关键词量很小，单线程更稳定，对实际速度影响可忽略。
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError as exc:
@@ -390,9 +393,89 @@ def semantic_clusters(
         ) from exc
 
     print("正在计算关键词语义相似度……")
-    model = SentenceTransformer("all-MiniLM-L6-v2")
-    embeddings = model.encode(terms.tolist(), normalize_embeddings=True, show_progress_bar=False)
-    sim = cosine_similarity(embeddings)
+    # CPU 对 macOS/Windows/Linux 都更稳定，且关键词数量较小，无需启动 GPU/MPS。
+    model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+    values = [str(term) for term in terms]
+    embeddings = model.encode(values, normalize_embeddings=True, show_progress_bar=False)
+    return cosine_similarity(embeddings)
+
+
+def semantic_groups(
+    terms: list[str], similarity: np.ndarray, threshold: float
+) -> tuple[dict[str, str], pd.DataFrame]:
+    """
+    用 complete-link 组成视觉语义组，防止 A≈B、B≈C 把差异较大的 A/C 链式并入。
+    只输出至少包含两个节点的组。
+    """
+    count = len(terms)
+    if threshold <= 0:
+        columns = [
+            "semantic_group", "keyword", "group_size",
+            "minimum_similarity_to_group", "mean_similarity_to_group",
+        ]
+        return {}, pd.DataFrame(columns=columns)
+    if similarity.shape != (count, count):
+        raise ValueError("语义相似度矩阵与关键词数量不匹配。")
+    uf = UnionFind(count)
+
+    def members(root: int) -> list[int]:
+        return [index for index in range(count) if uf.find(index) == root]
+
+    pairs = sorted(
+        ((float(similarity[i, j]), i, j) for i in range(count) for j in range(i + 1, count)),
+        reverse=True,
+    )
+    for score, left_index, right_index in pairs:
+        if score < threshold:
+            break
+        left_root, right_root = uf.find(left_index), uf.find(right_index)
+        if left_root == right_root:
+            continue
+        left, right = members(left_root), members(right_root)
+        if min(float(similarity[a, b]) for a in left for b in right) >= threshold:
+            uf.union(left_root, right_root)
+
+    raw_groups: dict[int, list[int]] = {}
+    for index in range(count):
+        raw_groups.setdefault(uf.find(index), []).append(index)
+    grouped = sorted(
+        (indices for indices in raw_groups.values() if len(indices) >= 2),
+        key=lambda indices: min(indices),
+    )
+
+    assignments: dict[str, str] = {}
+    rows: list[dict] = []
+    for number, indices in enumerate(grouped, start=1):
+        group_id = f"G{number}"
+        for index in indices:
+            peers = [other for other in indices if other != index]
+            assignments[terms[index]] = group_id
+            rows.append({
+                "semantic_group": group_id,
+                "keyword": terms[index],
+                "group_size": len(indices),
+                "minimum_similarity_to_group": round(
+                    min(float(similarity[index, other]) for other in peers), 4
+                ),
+                "mean_similarity_to_group": round(
+                    float(np.mean([similarity[index, other] for other in peers])), 4
+                ),
+            })
+    columns = [
+        "semantic_group", "keyword", "group_size",
+        "minimum_similarity_to_group", "mean_similarity_to_group",
+    ]
+    return assignments, pd.DataFrame(rows, columns=columns)
+
+
+def semantic_clusters(
+    terms: np.ndarray,
+    doc_frequency: np.ndarray,
+    merge_threshold: float,
+    suggest_threshold: float,
+    topic: TopicConfig | None = None,
+) -> tuple[list[list[int]], np.ndarray, pd.DataFrame]:
+    sim = semantic_similarity(terms)
     pairs = sorted(
         ((float(sim[i, j]), i, j) for i in range(len(terms)) for j in range(i + 1, len(terms))),
         reverse=True,
@@ -483,12 +566,17 @@ def merge_keyword_matrix(
 def build_network(
     terms: list[str], binary: np.ndarray, min_edge: int,
     min_association: float, max_edges_per_node: int,
+    group_assignments: dict[str, str] | None = None,
 ) -> tuple[nx.Graph, np.ndarray]:
     count_matrix = binary.astype(np.int64, copy=False)
     cooccurrence = count_matrix.T @ count_matrix
     graph = nx.Graph()
     for i, term in enumerate(terms):
-        graph.add_node(term, frequency=int(binary[:, i].sum()))
+        graph.add_node(
+            term,
+            frequency=int(binary[:, i].sum()),
+            semantic_group=(group_assignments or {}).get(term, ""),
+        )
 
     candidates: list[tuple[float, int, int, int]] = []
     for i in range(len(terms)):
@@ -515,27 +603,93 @@ def build_network(
     return graph, cooccurrence
 
 
-def draw_network(graph: nx.Graph, output: Path, seed: int, show: bool) -> None:
-    # 保留孤立节点在数据文件中，但不挤占主网络图空间。
+GROUP_COLORS = (
+    "#F59E0B", "#10B981", "#8B5CF6", "#EF4444", "#06B6D4",
+    "#EC4899", "#84CC16", "#F97316", "#6366F1", "#14B8A6",
+)
+
+
+def _visible_grouped_graph(graph: nx.Graph) -> nx.Graph:
     drawn = graph.copy()
-    drawn.remove_nodes_from(list(nx.isolates(drawn)))
+    hidden = [
+        node for node in nx.isolates(drawn)
+        if not drawn.nodes[node].get("semantic_group")
+    ]
+    drawn.remove_nodes_from(hidden)
+    return drawn
+
+
+def _grouped_layout(graph: nx.Graph, seed: int, x_scale: float = 1.0,
+                    y_scale: float = 1.0) -> dict[str, np.ndarray]:
+    """语义组内加入仅用于布局的隐形引力，使分组边界更清晰。"""
+    layout_graph = graph.copy()
+    for source, target, data in layout_graph.edges(data=True):
+        data["layout_weight"] = max(0.05, float(data.get("association_strength", 0.0)))
+    groups: dict[str, list[str]] = {}
+    for node, data in layout_graph.nodes(data=True):
+        if data.get("semantic_group"):
+            groups.setdefault(str(data["semantic_group"]), []).append(node)
+    for members in groups.values():
+        for i, source in enumerate(members):
+            for target in members[i + 1:]:
+                if layout_graph.has_edge(source, target):
+                    layout_graph[source][target]["layout_weight"] += 3.0
+                else:
+                    layout_graph.add_edge(source, target, layout_weight=3.0)
+    positions = nx.spring_layout(
+        layout_graph, seed=seed,
+        k=2.2 / np.sqrt(max(1, layout_graph.number_of_nodes())),
+        iterations=500, weight="layout_weight",
+    )
+    return {
+        node: np.array([float(point[0]) * x_scale, float(point[1]) * y_scale])
+        for node, point in positions.items()
+    }
+
+
+def draw_network(graph: nx.Graph, output: Path, seed: int, show: bool) -> None:
+    # 普通孤立节点只保留在数据文件中；语义分组节点即使无共现边也会显示。
+    drawn = _visible_grouped_graph(graph)
     if drawn.number_of_nodes() == 0:
         print("[提示] 当前 min-edge 下没有可绘制的连接；CSV 结果仍已保存。")
         return
 
     plt.rcParams.update({"font.family": "DejaVu Sans", "axes.unicode_minus": False})
     fig, ax = plt.subplots(figsize=(16, 12))
-    pos = nx.spring_layout(drawn, seed=seed, k=2.2 / np.sqrt(max(1, drawn.number_of_nodes())),
-                           iterations=500, weight="association_strength")
+    pos = _grouped_layout(drawn, seed)
     frequencies = np.array([drawn.nodes[n]["frequency"] for n in drawn.nodes()], dtype=float)
     node_sizes = 450 + 550 * frequencies
     degrees = np.array([drawn.degree(n, weight="weight") for n in drawn.nodes()], dtype=float)
     colors = plt.cm.Blues(0.35 + 0.55 * degrees / max(1.0, degrees.max()))
     widths = [0.5 + 4.0 * drawn[u][v]["association_strength"] for u, v in drawn.edges()]
 
+    semantic_sets: dict[str, list[str]] = {}
+    for node, data in drawn.nodes(data=True):
+        if data.get("semantic_group"):
+            semantic_sets.setdefault(str(data["semantic_group"]), []).append(node)
+    for color_index, (group_id, members) in enumerate(sorted(semantic_sets.items())):
+        points = np.array([pos[node] for node in members])
+        padding = 0.09
+        left, bottom = points.min(axis=0) - padding
+        right, top = points.max(axis=0) + padding
+        color = GROUP_COLORS[color_index % len(GROUP_COLORS)]
+        box = FancyBboxPatch(
+            (left, bottom), max(right - left, 0.18), max(top - bottom, 0.18),
+            boxstyle="round,pad=0.025,rounding_size=0.04",
+            facecolor=color, edgecolor=color, alpha=0.12, linewidth=1.8, zorder=0,
+        )
+        ax.add_patch(box)
+        ax.text(left + 0.015, top - 0.005, group_id, color=color, fontsize=9,
+                fontweight="bold", va="top", zorder=1)
+
     nx.draw_networkx_edges(drawn, pos, ax=ax, width=widths, alpha=0.38, edge_color="#6F839B")
+    node_borders = [
+        GROUP_COLORS[(int(str(drawn.nodes[node]["semantic_group"])[1:]) - 1) % len(GROUP_COLORS)]
+        if drawn.nodes[node].get("semantic_group") else "white"
+        for node in drawn.nodes()
+    ]
     nx.draw_networkx_nodes(drawn, pos, ax=ax, node_size=node_sizes, node_color=colors,
-                           edgecolors="white", linewidths=1.2, alpha=0.95)
+                           edgecolors=node_borders, linewidths=2.0, alpha=0.95)
     nx.draw_networkx_labels(drawn, pos, ax=ax, font_size=9, font_color="#172331")
     ax.set_title("Keyword Co-occurrence Network", fontsize=18, pad=18)
     ax.axis("off")
@@ -548,22 +702,18 @@ def draw_network(graph: nx.Graph, output: Path, seed: int, show: bool) -> None:
 
 def write_interactive_network(graph: nx.Graph, output: Path, seed: int) -> None:
     """Write a standalone interactive SVG network without extra dependencies."""
-    drawn = graph.copy()
-    drawn.remove_nodes_from(list(nx.isolates(drawn)))
+    drawn = _visible_grouped_graph(graph)
     if drawn.number_of_nodes() == 0:
         return
 
-    positions = nx.spring_layout(
-        drawn, seed=seed,
-        k=2.2 / np.sqrt(max(1, drawn.number_of_nodes())),
-        iterations=500, weight="association_strength",
-    )
+    positions = _grouped_layout(drawn, seed, x_scale=420, y_scale=320)
     nodes = [{
         "id": str(node),
-        "x": round(float(positions[node][0]) * 420, 3),
-        "y": round(float(positions[node][1]) * 320, 3),
+        "x": round(float(positions[node][0]), 3),
+        "y": round(float(positions[node][1]), 3),
         "frequency": int(drawn.nodes[node]["frequency"]),
         "weighted_degree": round(float(drawn.degree(node, weight="weight")), 3),
+        "semantic_group": str(drawn.nodes[node].get("semantic_group", "")),
     } for node in drawn.nodes()]
     edges = [{
         "source": str(source), "target": str(target),
@@ -588,6 +738,7 @@ input[type=range]{vertical-align:middle}button{padding:7px 11px;border:1px solid
 .edge{stroke:#71869d;stroke-opacity:.34;vector-effect:non-scaling-stroke}.node circle{stroke:#fff;stroke-width:2;
 vector-effect:non-scaling-stroke;cursor:move}.node text{fill:#172331;font-size:12px;text-anchor:middle;pointer-events:none;
 paint-order:stroke;stroke:#fff;stroke-width:3px;stroke-linejoin:round}.dim{opacity:.08!important}.highlight circle{stroke:#f59e0b;stroke-width:4}
+.semantic-box rect{fill-opacity:.10;stroke-width:2;vector-effect:non-scaling-stroke}.semantic-box text{font-size:12px;font-weight:700}
 #tooltip{position:fixed;display:none;pointer-events:none;padding:8px 10px;border-radius:7px;background:rgba(23,35,49,.94);
 color:#fff;font-size:12px;line-height:1.45;box-shadow:0 4px 18px rgba(0,0,0,.18)}
 #help{position:fixed;left:14px;bottom:12px;color:#64748b;font-size:12px;pointer-events:none}
@@ -597,17 +748,26 @@ color:#fff;font-size:12px;line-height:1.45;box-shadow:0 4px 18px rgba(0,0,0,.18)
 <label>Association ≥ <span id="thresholdValue">0.00</span>
 <input id="threshold" type="range" min="0" max="1" step="0.01" value="0"></label>
 <button id="reset" type="button">Reset view</button></header>
-<svg id="network" viewBox="-520 -390 1040 780"><g id="viewport"><g id="edges"></g><g id="nodes"></g></g></svg>
+<svg id="network" viewBox="-520 -390 1040 780"><g id="viewport"><g id="groups"></g><g id="edges"></g><g id="nodes"></g></g></svg>
 <div id="tooltip"></div><div id="help">Drag nodes · drag background to pan · scroll to zoom · hover for details</div>
 <script>
 const data=__NETWORK_DATA__,svg=document.getElementById('network'),viewport=document.getElementById('viewport'),
-edgeLayer=document.getElementById('edges'),nodeLayer=document.getElementById('nodes'),tooltip=document.getElementById('tooltip');
+groupLayer=document.getElementById('groups'),edgeLayer=document.getElementById('edges'),nodeLayer=document.getElementById('nodes'),tooltip=document.getElementById('tooltip');
 const nodeById=new Map(data.nodes.map(n=>[n.id,n])),incident=new Map(data.nodes.map(n=>[n.id,new Set()]));
 data.edges.forEach(e=>{incident.get(e.source).add(e.target);incident.get(e.target).add(e.source)});
 const maxFrequency=Math.max(...data.nodes.map(n=>n.frequency),1),maxDegree=Math.max(...data.nodes.map(n=>n.weighted_degree),1);
+const groupColors=['#F59E0B','#10B981','#8B5CF6','#EF4444','#06B6D4','#EC4899','#84CC16','#F97316','#6366F1','#14B8A6'];
 let transform={x:0,y:0,k:1},drag=null;
 const radius=n=>9+15*Math.sqrt(n.frequency/maxFrequency);
 const color=n=>{const t=n.weighted_degree/maxDegree;return `hsl(${211-12*t} ${48+24*t}% ${72-30*t}%)`};
+const semanticGroups=new Map();data.nodes.forEach(n=>{if(n.semantic_group){if(!semanticGroups.has(n.semantic_group))semanticGroups.set(n.semantic_group,[]);semanticGroups.get(n.semantic_group).push(n)}});
+Array.from(semanticGroups.entries()).forEach(([id,members],index)=>{const g=document.createElementNS('http://www.w3.org/2000/svg','g');g.classList.add('semantic-box');
+const rect=document.createElementNS('http://www.w3.org/2000/svg','rect'),label=document.createElementNS('http://www.w3.org/2000/svg','text');
+const c=groupColors[index%groupColors.length];rect.setAttribute('rx','18');rect.setAttribute('fill',c);rect.setAttribute('stroke',c);
+label.setAttribute('fill',c);label.textContent=id;g.append(rect,label);groupLayer.appendChild(g);semanticGroups.set(id,{members,g,rect,label})});
+function updateGroups(){semanticGroups.forEach(group=>{const left=Math.min(...group.members.map(n=>n.x-Math.max(38,n.id.length*3.2))),right=Math.max(...group.members.map(n=>n.x+Math.max(38,n.id.length*3.2)));
+const top=Math.min(...group.members.map(n=>n.y-radius(n)-30)),bottom=Math.max(...group.members.map(n=>n.y+radius(n)+30));group.rect.setAttribute('x',left);group.rect.setAttribute('y',top);
+group.rect.setAttribute('width',right-left);group.rect.setAttribute('height',bottom-top);group.label.setAttribute('x',left+12);group.label.setAttribute('y',top+18)})}
 const applyTransform=()=>viewport.setAttribute('transform',`translate(${transform.x} ${transform.y}) scale(${transform.k})`);
 function updateEdge(e){const a=nodeById.get(e.source),b=nodeById.get(e.target);e.el.setAttribute('x1',a.x);
 e.el.setAttribute('y1',a.y);e.el.setAttribute('x2',b.x);e.el.setAttribute('y2',b.y)}
@@ -617,11 +777,12 @@ title.textContent=`${e.source} ↔ ${e.target}\nCo-occurring papers: ${e.weight}
 line.appendChild(title);e.el=line;edgeLayer.appendChild(line);updateEdge(e)});
 data.nodes.forEach(n=>{const g=document.createElementNS('http://www.w3.org/2000/svg','g');g.classList.add('node');
 g.setAttribute('transform',`translate(${n.x} ${n.y})`);const circle=document.createElementNS('http://www.w3.org/2000/svg','circle');
-circle.setAttribute('r',radius(n));circle.setAttribute('fill',color(n));const label=document.createElementNS('http://www.w3.org/2000/svg','text');
+circle.setAttribute('r',radius(n));circle.setAttribute('fill',color(n));if(n.semantic_group){const groupNumber=Number(n.semantic_group.slice(1))-1;circle.setAttribute('stroke',groupColors[groupNumber%groupColors.length]);circle.setAttribute('stroke-width','3')}
+const label=document.createElementNS('http://www.w3.org/2000/svg','text');
 label.setAttribute('y',radius(n)+16);label.textContent=n.id;g.append(circle,label);nodeLayer.appendChild(g);n.el=g;
 g.addEventListener('pointerdown',ev=>{ev.stopPropagation();g.setPointerCapture(ev.pointerId);
 drag={type:'node',node:n,sx:ev.clientX,sy:ev.clientY,x:n.x,y:n.y}});
-g.addEventListener('mouseenter',()=>{tooltip.innerHTML=`<strong>${n.id}</strong><br>Papers: ${n.frequency}<br>Weighted connections: ${n.weighted_degree}`;
+g.addEventListener('mouseenter',()=>{tooltip.innerHTML=`<strong>${n.id}</strong><br>Papers: ${n.frequency}<br>Weighted connections: ${n.weighted_degree}${n.semantic_group?`<br>Semantic group: ${n.semantic_group}`:''}`;
 tooltip.style.display='block';data.nodes.forEach(o=>o.el.classList.toggle('dim',o.id!==n.id&&!incident.get(n.id).has(o.id)));
 data.edges.forEach(e=>e.el.classList.toggle('dim',e.source!==n.id&&e.target!==n.id))});
 g.addEventListener('mousemove',ev=>{tooltip.style.left=`${ev.clientX+14}px`;tooltip.style.top=`${ev.clientY+14}px`});
@@ -632,7 +793,7 @@ drag={type:'pan',sx:ev.clientX,sy:ev.clientY,x:transform.x,y:transform.y}});
 svg.addEventListener('pointermove',ev=>{if(!drag)return;if(drag.type==='pan'){transform.x=drag.x+ev.clientX-drag.sx;
 transform.y=drag.y+ev.clientY-drag.sy;applyTransform()}else{drag.node.x=drag.x+(ev.clientX-drag.sx)/transform.k;
 drag.node.y=drag.y+(ev.clientY-drag.sy)/transform.k;drag.node.el.setAttribute('transform',`translate(${drag.node.x} ${drag.node.y})`);
-data.edges.filter(e=>e.source===drag.node.id||e.target===drag.node.id).forEach(updateEdge)}});
+data.edges.filter(e=>e.source===drag.node.id||e.target===drag.node.id).forEach(updateEdge);updateGroups()}});
 function stopDrag(){drag=null;svg.classList.remove('dragging')}svg.addEventListener('pointerup',stopDrag);svg.addEventListener('pointercancel',stopDrag);
 svg.addEventListener('wheel',ev=>{ev.preventDefault();transform.k=Math.min(6,Math.max(.25,transform.k*(ev.deltaY<0?1.12:.89)));applyTransform()},{passive:false});
 document.getElementById('threshold').addEventListener('input',ev=>{const value=Number(ev.target.value);
@@ -640,6 +801,7 @@ document.getElementById('thresholdValue').textContent=value.toFixed(2);data.edge
 document.getElementById('search').addEventListener('input',ev=>{const q=ev.target.value.trim().toLowerCase();
 data.nodes.forEach(n=>n.el.classList.toggle('highlight',Boolean(q)&&n.id.toLowerCase().includes(q)))});
 document.getElementById('reset').addEventListener('click',()=>{transform={x:0,y:0,k:1};applyTransform()});
+updateGroups();
 </script></body></html>
 """.replace("__NETWORK_DATA__", payload)
     (output / "keyword_network.html").write_text(page, encoding="utf-8")
@@ -649,7 +811,8 @@ def save_results(
     output: Path, papers: list[Paper], summary: list[dict], candidates: pd.DataFrame,
     excluded_candidates: pd.DataFrame,
     terms: list[str], binary: np.ndarray, cooccurrence: np.ndarray,
-    audit: pd.DataFrame, suggestions: pd.DataFrame, graph: nx.Graph,
+    audit: pd.DataFrame, suggestions: pd.DataFrame, group_table: pd.DataFrame,
+    graph: nx.Graph,
 ) -> None:
     output.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(summary).to_csv(output / "paper_summary.csv", index=False, encoding="utf-8-sig")
@@ -659,6 +822,7 @@ def save_results(
     )
     audit.to_csv(output / "keyword_clusters.csv", index=False, encoding="utf-8-sig")
     suggestions.to_csv(output / "merge_suggestions.csv", index=False, encoding="utf-8-sig")
+    group_table.to_csv(output / "semantic_groups.csv", index=False, encoding="utf-8-sig")
 
     frequency = pd.DataFrame({
         "keyword": terms,
@@ -698,6 +862,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("max-df 必须在 (0, 1]。")
     if not 0 <= args.suggest_threshold <= args.merge_threshold <= 1:
         raise ValueError("需满足 0 <= suggest-threshold <= merge-threshold <= 1。")
+    if not 0 <= args.group_threshold <= args.merge_threshold:
+        raise ValueError("需满足 0 <= group-threshold <= merge-threshold。")
     if not 0 <= args.min_association <= 1:
         raise ValueError("min-association 必须在 [0, 1]。")
     if args.max_edges_per_node < 0:
@@ -740,6 +906,10 @@ def main() -> int:
             suggestions = pd.DataFrame(columns=[
                 "keyword_1", "keyword_2", "cosine_similarity", "protected_from_merge"
             ])
+            merged_similarity = (
+                semantic_similarity(merged_terms) if args.group_threshold > 0
+                else np.eye(len(merged_terms))
+            )
         else:
             terms, binary, df, mean_tfidf, candidates, excluded_candidates = extract_candidates(
                 documents, args.top_n, args.min_df, args.max_df, topic
@@ -750,13 +920,19 @@ def main() -> int:
             merged_terms, merged_binary, audit = merge_keyword_matrix(
                 terms, binary, df, mean_tfidf, clusters, similarity
             )
+            original_index = {str(term): index for index, term in enumerate(terms)}
+            representative_indices = [original_index[term] for term in merged_terms]
+            merged_similarity = similarity[np.ix_(representative_indices, representative_indices)]
+        group_assignments, group_table = semantic_groups(
+            merged_terms, merged_similarity, args.group_threshold
+        )
         graph, cooccurrence = build_network(
             merged_terms, merged_binary, args.min_edge,
-            args.min_association, args.max_edges_per_node,
+            args.min_association, args.max_edges_per_node, group_assignments,
         )
         save_results(args.output, papers, summary, candidates, excluded_candidates,
                      merged_terms, merged_binary,
-                     cooccurrence, audit, suggestions, graph)
+                     cooccurrence, audit, suggestions, group_table, graph)
         draw_network(graph, args.output, args.seed, args.show)
         write_interactive_network(graph, args.output, args.seed)
 
@@ -772,6 +948,8 @@ def main() -> int:
             print(f"\n完成：纳入 {len(papers)} 篇论文，候选词 {len(terms)} 个，"
                   f"自动合并 {merged_count} 个，最终概念 {len(merged_terms)} 个。")
         print(f"网络：{graph.number_of_nodes()} 个节点，{graph.number_of_edges()} 条边。")
+        print(f"语义分组：{group_table['semantic_group'].nunique()} 组，"
+              f"共 {len(group_table)} 个被标记节点。")
         print(f"结果目录：{args.output.resolve()}")
         return 0
     except Exception as exc:
