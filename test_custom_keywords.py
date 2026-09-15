@@ -5,12 +5,14 @@ from pathlib import Path
 import numpy as np
 
 from literature_keyword_network import (
+    build_network,
     build_topic_config,
     extract_candidates,
     extract_custom_keywords,
     load_custom_keywords,
     relevant_context,
     semantic_groups,
+    write_interactive_network,
 )
 
 
@@ -101,6 +103,23 @@ class CustomKeywordTests(unittest.TestCase):
         self.assertEqual(assignments, {"alpha": "G1", "beta": "G1"})
         self.assertEqual(table["keyword"].tolist(), ["alpha", "beta"])
         self.assertTrue((table["group_size"] == 2).all())
+
+    def test_html_can_toggle_raw_and_normalized_edge_width(self):
+        binary = np.array([[1, 1], [1, 0]], dtype=np.uint8)
+        graph, _ = build_network(
+            ["alpha", "beta"], binary, min_edge=1,
+            min_association=0, max_edges_per_node=0,
+        )
+        self.assertAlmostEqual(
+            graph["alpha"]["beta"]["association_strength"],
+            1 / np.sqrt(2), places=6,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            write_interactive_network(graph, Path(directory), seed=42)
+            html = (Path(directory) / "keyword_network.html").read_text(encoding="utf-8")
+        self.assertIn('id="normalizeEdges"', html)
+        self.assertIn("normalized?e.association:e.weight/maxEdgeWeight", html)
+        self.assertIn("Normalized association", html)
 
 
 if __name__ == "__main__":

@@ -661,7 +661,8 @@ def draw_network(graph: nx.Graph, output: Path, seed: int, show: bool) -> None:
     node_sizes = 450 + 550 * frequencies
     degrees = np.array([drawn.degree(n, weight="weight") for n in drawn.nodes()], dtype=float)
     colors = plt.cm.Blues(0.35 + 0.55 * degrees / max(1.0, degrees.max()))
-    widths = [0.5 + 4.0 * drawn[u][v]["association_strength"] for u, v in drawn.edges()]
+    max_edge_weight = max((data["weight"] for _, _, data in drawn.edges(data=True)), default=1)
+    widths = [0.5 + 4.0 * drawn[u][v]["weight"] / max_edge_weight for u, v in drawn.edges()]
 
     semantic_sets: dict[str, list[str]] = {}
     for node, data in drawn.nodes(data=True):
@@ -733,7 +734,7 @@ def write_interactive_network(graph: nx.Graph, output: Path, seed: int) -> None:
 body{margin:0;background:#f6f8fb}header{display:flex;flex-wrap:wrap;align-items:center;gap:14px;
 padding:14px 18px;background:#fff;border-bottom:1px solid #dce3ec}h1{margin:0 auto 0 0;font-size:18px}
 label{font-size:13px;color:#4b5f74}input[type=search]{width:210px;padding:7px 10px;border:1px solid #bdc9d7;border-radius:7px}
-input[type=range]{vertical-align:middle}button{padding:7px 11px;border:1px solid #bdc9d7;border-radius:7px;background:#fff;cursor:pointer}
+input[type=range],input[type=checkbox]{vertical-align:middle}button{padding:7px 11px;border:1px solid #bdc9d7;border-radius:7px;background:#fff;cursor:pointer}
 #network{width:100vw;height:calc(100vh - 66px);background:#fff;cursor:grab}#network.dragging{cursor:grabbing}
 .edge{stroke:#71869d;stroke-opacity:.34;vector-effect:non-scaling-stroke}.node circle{stroke:#fff;stroke-width:2;
 vector-effect:non-scaling-stroke;cursor:move}.node text{fill:#172331;font-size:12px;text-anchor:middle;pointer-events:none;
@@ -747,6 +748,8 @@ color:#fff;font-size:12px;line-height:1.45;box-shadow:0 4px 18px rgba(0,0,0,.18)
 <input id="search" type="search" placeholder="Search keywords…" aria-label="Search keywords">
 <label>Association ≥ <span id="thresholdValue">0.00</span>
 <input id="threshold" type="range" min="0" max="1" step="0.01" value="0"></label>
+<label title="Divide co-occurrence by the geometric mean of the two keyword frequencies">
+<input id="normalizeEdges" type="checkbox"> Normalize edge width</label>
 <button id="reset" type="button">Reset view</button></header>
 <svg id="network" viewBox="-520 -390 1040 780"><g id="viewport"><g id="groups"></g><g id="edges"></g><g id="nodes"></g></g></svg>
 <div id="tooltip"></div><div id="help">Drag nodes · drag background to pan · scroll to zoom · hover for details</div>
@@ -755,7 +758,8 @@ const data=__NETWORK_DATA__,svg=document.getElementById('network'),viewport=docu
 groupLayer=document.getElementById('groups'),edgeLayer=document.getElementById('edges'),nodeLayer=document.getElementById('nodes'),tooltip=document.getElementById('tooltip');
 const nodeById=new Map(data.nodes.map(n=>[n.id,n])),incident=new Map(data.nodes.map(n=>[n.id,new Set()]));
 data.edges.forEach(e=>{incident.get(e.source).add(e.target);incident.get(e.target).add(e.source)});
-const maxFrequency=Math.max(...data.nodes.map(n=>n.frequency),1),maxDegree=Math.max(...data.nodes.map(n=>n.weighted_degree),1);
+const maxFrequency=Math.max(...data.nodes.map(n=>n.frequency),1),maxDegree=Math.max(...data.nodes.map(n=>n.weighted_degree),1),
+maxEdgeWeight=Math.max(...data.edges.map(e=>e.weight),1);
 const groupColors=['#F59E0B','#10B981','#8B5CF6','#EF4444','#06B6D4','#EC4899','#84CC16','#F97316','#6366F1','#14B8A6'];
 let transform={x:0,y:0,k:1},drag=null;
 const radius=n=>9+15*Math.sqrt(n.frequency/maxFrequency);
@@ -771,9 +775,11 @@ group.rect.setAttribute('width',right-left);group.rect.setAttribute('height',bot
 const applyTransform=()=>viewport.setAttribute('transform',`translate(${transform.x} ${transform.y}) scale(${transform.k})`);
 function updateEdge(e){const a=nodeById.get(e.source),b=nodeById.get(e.target);e.el.setAttribute('x1',a.x);
 e.el.setAttribute('y1',a.y);e.el.setAttribute('x2',b.x);e.el.setAttribute('y2',b.y)}
+function updateEdgeWidths(){const normalized=document.getElementById('normalizeEdges').checked;
+data.edges.forEach(e=>{const strength=normalized?e.association:e.weight/maxEdgeWeight;e.el.style.strokeWidth=`${.7+4.3*strength}px`})}
 data.edges.forEach(e=>{const line=document.createElementNS('http://www.w3.org/2000/svg','line');line.classList.add('edge');
-line.style.strokeWidth=`${.7+4.3*e.association}px`;const title=document.createElementNS('http://www.w3.org/2000/svg','title');
-title.textContent=`${e.source} ↔ ${e.target}\nCo-occurring papers: ${e.weight}\nAssociation: ${e.association.toFixed(3)}`;
+const title=document.createElementNS('http://www.w3.org/2000/svg','title');
+title.textContent=`${e.source} ↔ ${e.target}\nCo-occurring papers: ${e.weight}\nNormalized association: ${e.association.toFixed(3)}`;
 line.appendChild(title);e.el=line;edgeLayer.appendChild(line);updateEdge(e)});
 data.nodes.forEach(n=>{const g=document.createElementNS('http://www.w3.org/2000/svg','g');g.classList.add('node');
 g.setAttribute('transform',`translate(${n.x} ${n.y})`);const circle=document.createElementNS('http://www.w3.org/2000/svg','circle');
@@ -798,10 +804,11 @@ function stopDrag(){drag=null;svg.classList.remove('dragging')}svg.addEventListe
 svg.addEventListener('wheel',ev=>{ev.preventDefault();transform.k=Math.min(6,Math.max(.25,transform.k*(ev.deltaY<0?1.12:.89)));applyTransform()},{passive:false});
 document.getElementById('threshold').addEventListener('input',ev=>{const value=Number(ev.target.value);
 document.getElementById('thresholdValue').textContent=value.toFixed(2);data.edges.forEach(e=>e.el.style.display=e.association>=value?'':'none')});
+document.getElementById('normalizeEdges').addEventListener('change',updateEdgeWidths);
 document.getElementById('search').addEventListener('input',ev=>{const q=ev.target.value.trim().toLowerCase();
 data.nodes.forEach(n=>n.el.classList.toggle('highlight',Boolean(q)&&n.id.toLowerCase().includes(q)))});
 document.getElementById('reset').addEventListener('click',()=>{transform={x:0,y:0,k:1};applyTransform()});
-updateGroups();
+updateGroups();updateEdgeWidths();
 </script></body></html>
 """.replace("__NETWORK_DATA__", payload)
     (output / "keyword_network.html").write_text(page, encoding="utf-8")

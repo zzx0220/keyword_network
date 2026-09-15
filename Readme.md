@@ -71,6 +71,15 @@ python literature_keyword_network.py ./papers --keywords-file keywords.txt \
   --merge-threshold 1.0 --group-threshold 0.72
 ```
 
+## 边宽频率标准化
+
+交互式 `keyword_network.html` 的顶部工具栏包含 **Normalize edge width** 选项：
+
+- 未勾选时，边宽按两个关键词共同出现的论文数显示。
+- 勾选后，边宽按 `cooccurrence / sqrt(frequency1 × frequency2)` 显示。
+
+该归一化值为 0–1，可减少高频词因文章集合主题偏差而产生的边宽优势。切换只改变边的视觉粗细，不会改变节点、边或 CSV 数据。顶部的 Association 滑块仍可独立用于过滤较弱连接。
+
 ## 安装
 
 ```bash
